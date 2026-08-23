@@ -1,6 +1,15 @@
-﻿[browser]
+[theme]
+primaryColor = "#4A9EFF"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#262730"
+textColor = "#FAFAFA"
+font = "sans serif"
+
+[browser]
 gatherUsageStats = false
 
-[theme]
-base = "dark"
-primaryColor = "#4A9EFF"
+[client]
+toolbarMode = "minimal"
+
+[logger]
+level = "info"

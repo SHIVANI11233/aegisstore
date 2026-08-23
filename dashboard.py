@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from aegisstore import context, db, decision_engine, executor, predictor, safety_gate, scanner, storage_story
+from aegisstore import context, db, decision_engine, executor, predictor, safety_gate, scanner, storage_story, storage_intelligence
 from demo_setup import build_demo
 
 st.set_page_config(page_title="AegisStore", page_icon="AegisStore", layout="wide")
@@ -63,17 +63,24 @@ if reset_clicked:
     db_path = Path(__file__).parent / "aegisstore.db"
     if db_path.exists():
         db_path.unlink()
-    for key in ["bootstrapped", "results", "summary", "reclaimable", "forecast"]:
+    for key in ["bootstrapped", "results", "summary", "reclaimable", "forecast", "forecast_detailed"]:
         st.session_state.pop(key, None)
     st.rerun()
 
 load = safety_gate.read_system_load(sample_seconds=0.3)
 busy = safety_gate.is_system_busy(load)
+state = str(load.get("state", "NORMAL"))
 
-l1, l2, l3 = st.columns(3)
+l1, l2, l3, l4, l5 = st.columns(5)
 l1.metric("CPU", f"{load['cpu_percent']:.0f}%")
-l2.metric("I/O wait", f"{load['io_wait_percent']:.0f}%")
-l3.metric("Safety Gate", "BUSY" if busy else "Normal")
+l2.metric("RAM", f"{load['memory_percent']:.0f}%")
+l3.metric("Disk Read", f"{load['disk_read_mb_s']:.1f} MB/s")
+l4.metric("Disk Write", f"{load['disk_write_mb_s']:.1f} MB/s")
+l5.metric("Safety Gate", state)
+
+st.caption(f"I/O Wait: {load['io_wait_percent']:.0f}%" if load.get('io_wait_percent') is not None else "I/O Wait: N/A")
+if busy:
+    st.warning("⚠ LIVE SAFETY OVERRIDE ACTIVE\n\nAutomatic cleanup is temporarily disabled because the system is currently under high workload.")
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -85,62 +92,91 @@ if scan_clicked:
     if not Path(target).exists():
         st.error(f"'{target}' does not exist. Run `python3 demo_setup.py {target}` first.")
     else:
-        with st.spinner("Scanning filesystem..."):
-            total, used, _free = shutil.disk_usage(target)
-            db.log_usage(target, used, total)
+        progress = st.progress(0)
+        status = st.empty()
+        
+        status.text("📁 Scanning filesystem... (fast mode)")
+        total, used, _free = shutil.disk_usage(target)
+        db.log_usage(target, used, total)
 
-            records = scanner.scan_and_classify(target)
-            candidates, reclaimable = scanner.reclaimable_summary(records)
+        records = scanner.scan_and_classify(target)
+        progress.progress(33)
+        status.text("🔍 Analyzing risk scores... (33%)")
+        
+        candidates, reclaimable = scanner.reclaimable_summary(records)
+        
+        # Limit to top 20 candidates by size for maximum speed
+        candidates = sorted(candidates, key=lambda r: r["size_bytes"], reverse=True)[:20]
+        progress.progress(66)
+        status.text("⚙️  Computing decisions... (66%)")
 
-            rows = []
-            for c in sorted(candidates, key=lambda r: r["size_bytes"], reverse=True)[:20]:
-                ctx = context.enrich(str(c["path"]))
-                decision = decision_engine.assess(c, ctx, load, busy)
-                cid = db.save_candidate(c)
-                db.save_decision(cid, {**ctx, "cpu_percent": load["cpu_percent"],
-                                        "io_wait_percent": load["io_wait_percent"], **decision})
-                rows.append({
-                    "File": c["path"].name,
-                    "Path": str(c["path"]),
-                    "Size": human(c["size_bytes"]),
-                    "Age (days)": c["age_days"],
-                    "Classification": c["classification"],
-                    "Confidence": f"{c['confidence']:.0%}",
-                    "Active": ctx["active_process"],
-                    "Pkg-owned": ctx["package_owned"],
-                    "Git-tracked": ctx["git_tracked"],
-                    "Risk": decision["risk_tier"],
-                    "Action": decision["action"],
-                    "Reason": decision["reason"],
-                })
+        rows = []
+        for idx, c in enumerate(candidates):
+            ctx = context.enrich(str(c["path"]))
+            decision = decision_engine.assess(c, ctx, load, busy)
+            cid = db.save_candidate(c)
+            db.save_decision(cid, {**ctx, "cpu_percent": load["cpu_percent"],
+                                    "io_wait_percent": load["io_wait_percent"], **decision})
+            rows.append({
+                "File": c["path"].name,
+                "Path": str(c["path"]),
+                "Size": human(c["size_bytes"]),
+                "Age (days)": c["age_days"],
+                "Classification": c["classification"],
+                "Confidence": f"{c['confidence']:.0%}",
+                "Active": ctx["active_process"],
+                "Pkg-owned": ctx["package_owned"],
+                "Git-tracked": ctx["git_tracked"],
+                "risk_score": decision["risk_score"],
+                "risk_tier": decision["risk_tier"],
+                "action": decision["action"],
+                "reason": decision["reason"],
+                "factors": decision.get("factors", []),
+                "Risk": decision["risk_tier"],
+                "Risk Score": f"{decision['risk_score']} / 100",
+                "Action": decision["action"],
+                "Reason": decision["reason"],
+            })
 
-            st.session_state.results = rows
-            st.session_state.reclaimable = reclaimable
-            st.session_state.total_disk = total
-            st.session_state.used_disk = used
-            st.session_state.target = target
+        progress.progress(85)
+        status.text("📊 Generating forecasts... (85%)")
+        
+        st.session_state.results = rows
+        st.session_state.reclaimable = reclaimable
+        st.session_state.total_disk = total
+        st.session_state.used_disk = used
+        st.session_state.target = target
 
-            automated = [r for r in rows if r["Action"] == "AUTOMATE"]
-            deferred = [r for r in rows if r["Action"] == "DEFER"]
-            avg_conf = (sum(float(r["Confidence"].strip("%")) for r in rows) / 100 / len(rows)) if rows else 0
-            fc = predictor.forecast(target)
+        automated = [r for r in rows if r["Action"] == "AUTOMATE"]
+        deferred = [r for r in rows if r["Action"] == "DEFER"]
+        avg_conf = (sum(float(r["Confidence"].strip("%")) for r in rows) / 100 / len(rows)) if rows else 0
+        fc = predictor.forecast(target)
+        fc_detailed = storage_intelligence.storage_forecast_detailed(target, reclaimable_bytes=reclaimable)
 
-            summary = {
-                "total_candidates": len(rows),
-                "total_reclaimable_gb": reclaimable / (1024 ** 3),
-                "top_reason": "cold/redundant data",
-                "deferred_count": len(deferred),
-                "automated_count": len(automated),
-                "avg_confidence": avg_conf,
-            }
-            if fc:
-                summary["growth_rate_gb_per_day"] = fc["growth_rate_gb_per_day"]
-                summary["days_to_90pct"] = fc["predictions_days"].get(0.90)
-                st.session_state.forecast = fc
-            else:
-                st.session_state.forecast = None
+        summary = {
+            "total_candidates": len(records),
+            "total_reclaimable_gb": reclaimable / (1024 ** 3),
+            "top_reason": "cold/redundant data",
+            "deferred_count": len(deferred),
+            "automated_count": len(automated),
+            "avg_confidence": avg_conf,
+        }
+        if fc:
+            summary["growth_rate_gb_per_day"] = fc["growth_rate_gb_per_day"]
+            summary["days_to_90pct"] = fc["predictions_days"].get(0.90)
+            st.session_state.forecast = fc
+            st.session_state.forecast_detailed = fc_detailed
+        else:
+            st.session_state.forecast = None
+            st.session_state.forecast_detailed = fc_detailed
 
-            st.session_state.summary = summary
+        st.session_state.summary = summary
+        progress.progress(100)
+        status.text("✅ Scan complete!")
+        st.success(f"✅ Analyzed {len(records)} files. Top {len(rows)} candidates shown. {len(automated)} ready for cleanup.")
+        time.sleep(0.5)
+        progress.empty()
+        status.empty()
 
 if st.session_state.results is not None:
     used = st.session_state.used_disk
@@ -151,57 +187,169 @@ if st.session_state.results is not None:
     m2.metric("Reclaimable", human(st.session_state.reclaimable))
     m3.metric("Candidates found", len(st.session_state.results))
 
-    if st.session_state.forecast:
-        fc = st.session_state.forecast
+    # Live safety override banner uses the existing system-load reading from the project safety gate.
+    if busy:
+        st.warning(
+            "⚠ LIVE SAFETY OVERRIDE ACTIVE\n\n"
+            f"Cleanup has been deferred because the system is currently busy. "
+            f"CPU {load['cpu_percent']:.0f}%, RAM {load['memory_percent']:.0f}%, I/O wait {load['io_wait_percent']:.0f}%."
+        )
+
+    if st.session_state.get("forecast_detailed"):
+        fc_detail = st.session_state.forecast_detailed
+        fc = fc_detail["forecast"]
         st.subheader("Growth Forecast")
-        fcol1, fcol2, fcol3 = st.columns(3)
-        fcol1.metric("Growth rate", f"{fc['growth_rate_gb_per_day']:.2f} GB/day")
-        d90 = fc["predictions_days"].get(0.90)
-        fcol2.metric("Days to 90% capacity", f"{d90:.0f}" if d90 else "N/A")
-        d95 = fc["predictions_days"].get(0.95)
-        fcol3.metric("Days to 95% capacity", f"{d95:.0f}" if d95 else "N/A")
+        if fc:
+            fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
+            fcol1.metric("Current usage", f"{fc['current_usage_pct'] * 100:.0f}%")
+            fcol2.metric("Growth rate", fc_detail["growth_rate_formatted"])
+            d85 = fc["predictions_days"].get(0.85)
+            fcol3.metric("Days to 85%", f"{d85:.0f}" if d85 is not None else "N/A")
+            d90 = fc["predictions_days"].get(0.90)
+            fcol4.metric("Days to 90%", f"{d90:.0f}" if d90 is not None else "N/A")
+            d95 = fc["predictions_days"].get(0.95)
+            fcol5.metric("Days to 95%", f"{d95:.0f}" if d95 is not None else "N/A")
 
-        history_rows = db.usage_series(st.session_state.target)
-        if len(history_rows) >= 2:
-            chart_df = pd.DataFrame([{
-                "Date": datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d"),
-                "Used (GB)": r["used_bytes"] / (1024 ** 3),
-            } for r in history_rows])
-            chart_df = chart_df.drop_duplicates(subset="Date", keep="last").set_index("Date")
-            st.line_chart(chart_df, height=220)
+            st.metric("Forecast data quality", fc_detail["forecast_quality"])
 
-    st.subheader("Scan Results - Risk-Adaptive Decisions")
+            history_rows = db.usage_series(st.session_state.target)
+            if len(history_rows) >= 2:
+                chart_df = pd.DataFrame([{
+                    "Date": datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d"),
+                    "Historical usage (GB)": r["used_bytes"] / (1024 ** 3),
+                } for r in history_rows])
+                chart_df = chart_df.drop_duplicates(subset="Date", keep="last").set_index("Date")
+                st.line_chart(chart_df, height=220)
+
+            if fc_detail["cleanup_impact"]:
+                st.subheader("Potential Storage Impact")
+                ci = fc_detail["cleanup_impact"]
+                impact1, impact2, impact3, impact4 = st.columns(4)
+                impact1.metric("Current usage", ci["current_used_formatted"])
+                impact2.metric("Reclaimable", ci["reclaimable_formatted"])
+                impact3.metric("After cleanup", ci["estimated_after_formatted"])
+                impact4.metric("After cleanup %", f"{ci['estimated_after_pct'] * 100:.0f}%")
+
+                st.caption("Estimated impact if all currently reclaimable data were safely removed.")
+
+            st.subheader("Storage Intelligence")
+            st.info(fc_detail["recommendation"])
+        else:
+            st.info(fc_detail["recommendation"])
+    elif st.session_state.get("forecast_detailed"):
+        fc_detail = st.session_state.forecast_detailed
+        st.subheader("Growth Forecast")
+        st.info(fc_detail["recommendation"])
+    else:
+        st.info("Scan filesystem to see storage forecast.")
+
+    st.subheader("Risk Overview")
+    risk_counts = {tier: sum(1 for r in st.session_state.results if r.get("risk_tier") == tier) for tier in ["LOW", "MEDIUM", "HIGH"]}
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1.metric("LOW", risk_counts.get("LOW", 0))
+    rc2.metric("MEDIUM", risk_counts.get("MEDIUM", 0))
+    rc3.metric("HIGH", risk_counts.get("HIGH", 0))
+    rc4.metric("Total candidates", len(st.session_state.results))
+
+    st.subheader("Candidate Results - Risk-Adaptive Decisions")
     df = pd.DataFrame(st.session_state.results)
 
     def risk_color(val):
         return {"LOW": "background-color:#d4edda", "MEDIUM": "background-color:#fff3cd",
                 "HIGH": "background-color:#f8d7da"}.get(val, "")
 
-    st.dataframe(
-        df.drop(columns=["Path"]).style.map(risk_color, subset=["Risk"]),
-        width='stretch', hide_index=True,
-    )
+    display_df = df[["File", "Size", "Age (days)", "Classification", "Confidence",
+                     "Risk Score", "Risk", "Action", "Reason"]].copy()
+    display_df["Risk"] = display_df["Risk"].map({"LOW": "LOW", "MEDIUM": "MEDIUM", "HIGH": "HIGH"})
+    st.dataframe(display_df.style.map(risk_color, subset=["Risk"]), width='stretch', hide_index=True)
 
-    csv_bytes = df.drop(columns=["Path"]).to_csv(index=False).encode("utf-8")
+    csv_df = df[["File", "Size", "Age (days)", "Classification", "Confidence",
+                 "Path", "Active", "Pkg-owned", "Git-tracked",
+                 "risk_score", "risk_tier", "action", "reason", "factors"]].copy()
+    csv_df["factors"] = csv_df["factors"].apply(lambda v: "; ".join(v) if isinstance(v, list) else v)
+    csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download report (CSV)", data=csv_bytes,
                         file_name=f"aegisstore_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                         mime="text/csv")
 
+    st.subheader("Why This Decision?")
+    candidate_names = [r["File"] for r in st.session_state.results]
+    selected_file = st.selectbox("Select candidate", candidate_names, index=0 if candidate_names else None)
+    selected_candidate = next((r for r in st.session_state.results if r["File"] == selected_file), None)
+    if selected_candidate:
+        st.markdown(f"**File:** {selected_candidate['File']}")
+        st.markdown(f"**Risk Score:** {selected_candidate['Risk Score']}")
+        st.markdown(f"**Risk Level:** {selected_candidate['Risk']}")
+        st.markdown(f"**Recommended Action:** {selected_candidate['Action']}")
+        factors = selected_candidate.get("factors", [])
+        st.markdown("**Why?**")
+        if factors:
+            for factor in factors:
+                st.write(factor)
+        else:
+            st.write("No explanatory factors available.")
+        st.markdown(f"**Decision reason:** {selected_candidate['Reason']}")
+        st.markdown(f"**Recommendation:** {selected_candidate['Action']}")
+
     st.subheader("Take Action")
-    low_risk = [r for r in st.session_state.results if r["Action"] == "AUTOMATE"]
-    if low_risk:
-        st.write(f"{len(low_risk)} candidate(s) are LOW risk and eligible for automatic quarantine:")
-        for r in low_risk:
-            c1, c2 = st.columns([4, 1])
-            c1.write(f"**{r['File']}** - {r['Size']}, {r['Reason']}")
-            if c2.button("Quarantine", key=f"q_{r['Path']}"):
-                try:
-                    info = executor.quarantine_file(r["Path"], r["Reason"])
-                    st.success(f"Quarantined - integrity_verified={info['integrity_verified']}")
-                except FileNotFoundError:
-                    st.warning("Already quarantined or moved.")
-    else:
-        st.write("No auto-eligible (LOW risk) candidates from this scan.")
+    auto_eligible = [r for r in st.session_state.results if r["Action"] == "AUTOMATE"]
+    scheduled = [r for r in st.session_state.results if r["Action"] == "SCHEDULE"]
+    approval = [r for r in st.session_state.results if r["Action"] == "APPROVAL_REQUIRED"]
+    deferred = [r for r in st.session_state.results if r["Action"] == "DEFER"]
+    skipped = [r for r in st.session_state.results if r["Action"] == "SKIP"]
+
+    if auto_eligible:
+        st.info(f"🟢 {len(auto_eligible)} candidates ready for safe automatic cleanup.")
+        col_batch, col_safety = st.columns([2, 1])
+        if col_batch.button("Execute Batch Cleanup", type="primary", help="Quarantine all AUTOMATE-eligible files with safety verification"):
+            batch_candidates = [{"path": r["Path"], "reason": r["Reason"]} for r in auto_eligible]
+            batch_result = executor.batch_quarantine(batch_candidates, load, verify_safety=True)
+            
+            if batch_result["safety_cleared"]:
+                if batch_result["executed"]:
+                    st.success(
+                        f"✓ Executed: {len(batch_result['executed'])} files quarantined\n"
+                        f"📦 Recovered: {batch_result['total_bytes_recovered'] / (1024**3):.2f} GB"
+                    )
+                    st.balloons()
+                if batch_result["failed"]:
+                    st.warning(f"⚠ Failed: {len(batch_result['failed'])} files could not be quarantined")
+                    for fail in batch_result["failed"]:
+                        st.write(f"  • {Path(fail['path']).name}: {fail['error']}")
+            else:
+                st.warning(
+                    "🛑 SAFETY GATE ACTIVE\n\n"
+                    f"System is busy (CPU {load['cpu_percent']:.0f}%, RAM {load['memory_percent']:.0f}%). "
+                    f"Cleanup deferred to protect stability. All {len(batch_result['skipped'])} candidates remain safe."
+                )
+        
+        col_safety.metric("Safety Status", "PASS" if not busy else "DEFER")
+
+    action_groups = [
+        ("AUTOMATE", auto_eligible, "Ready for automatic quarantine."),
+        ("SCHEDULE", scheduled, "Handle during a safer window or after confirmation."),
+        ("APPROVAL_REQUIRED", approval, "Requires explicit user approval before any action."),
+        ("DEFER", deferred, "Do not execute while the system remains busy or unsafe."),
+        ("SKIP", skipped, "Safety checks blocked this file; no action will be taken."),
+    ]
+
+    st.write("**Individual Actions** (optional; use batch cleanup above for efficiency)")
+    for action_name, items, guidance in action_groups:
+        if items:
+            st.write(f"**{action_name}**")
+            st.caption(guidance)
+            for r in items:
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"**{r['File']}** - {r['Size']} | Risk {r['Risk']} | {r['Reason']}")
+                if action_name == "AUTOMATE":
+                    if c2.button("Quarantine", key=f"q_{r['Path']}"):
+                        try:
+                            info = executor.quarantine_file(r["Path"], r["Reason"])
+                            st.success(f"Quarantined - integrity_verified={info['integrity_verified']}")
+                        except FileNotFoundError:
+                            st.warning("Already quarantined or moved.")
+                else:
+                    c2.write("—")
 
     st.subheader("Storage Story")
     with st.spinner("Generating narrative..."):
@@ -209,6 +357,45 @@ if st.session_state.results is not None:
     st.info(story)
 
 st.divider()
+st.subheader("Recovery & Quarantine Management")
+recovery_stats = executor.recovery_stats()
+q1, q2, q3 = st.columns(3)
+q1.metric("Files in Quarantine", recovery_stats["file_count"])
+q2.metric("Total Size", f"{recovery_stats['total_bytes'] / (1024**3):.2f} GB")
+q3.metric("Integrity OK", f"{recovery_stats['integrity_ok']}/{recovery_stats['file_count']}")
+
+quarantine_items = executor.list_quarantine(limit=50)
+if quarantine_items:
+    st.write(f"**Recent Quarantined Files** ({len(quarantine_items)} shown)")
+    quar_rows = []
+    for item in quarantine_items:
+        quar_rows.append({
+            "File": Path(item["original_path"]).name,
+            "Original Path": item["original_path"],
+            "Reason": item["reason"],
+            "Size (GB)": f"{item['size_bytes'] / (1024**3):.2f}",
+            "Integrity": "✓" if item["integrity_verified"] else "✗",
+        })
+    
+    quar_df = pd.DataFrame(quar_rows)
+    st.dataframe(quar_df, width='stretch', hide_index=True)
+    
+    st.write("**Recover Files**")
+    selected_quar = st.selectbox(
+        "Select a quarantined file to recover",
+        options=[item["quarantine_path"] for item in quarantine_items],
+        format_func=lambda p: Path(p).name,
+    )
+    if selected_quar and st.button("Restore to Original Location", help="Move file back from quarantine"):
+        try:
+            restore_result = executor.undo_last(selected_quar)
+            st.success(f"Restored: {restore_result['restored_to']}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Recovery failed: {e}")
+else:
+    st.info("No files in quarantine. All cleanup operations are fully applied.")
+
 st.subheader("Audit Log")
 audit_rows = db.recent_audit(limit=15)
 if audit_rows:

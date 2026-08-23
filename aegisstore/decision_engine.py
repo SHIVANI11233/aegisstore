@@ -2,8 +2,9 @@
 decision_engine.py — The Risk-Adaptive Decision Engine (core innovation).
 
 Combines: data importance, AI confidence, context signals, and real-time system
-workload into ONE risk tier + action. This is the module every teammate should
-be able to explain to a judge.
+workload into ONE numeric risk score, risk tier, action, and explainable factors.
+The output stays backward-compatible with the older {risk_tier, action, reason}
+shape while adding the stronger 0–100 scoring model required by the demo.
 """
 
 LOW, MEDIUM, HIGH = "LOW", "MEDIUM", "HIGH"
@@ -15,43 +16,169 @@ def assess(candidate: dict, ctx: dict, load: dict, system_busy: bool) -> dict:
     ctx:       output of context.enrich()    (active_process, package_owned, git_tracked)
     load:      output of safety_gate.read_system_load()
     system_busy: output of safety_gate.is_system_busy(load)
-    Returns: {"risk_tier": ..., "action": ..., "reason": ...}
+    Returns: {
+        "risk_score": 0-100,
+        "risk_tier": "LOW|MEDIUM|HIGH",
+        "action": "AUTOMATE|SCHEDULE|APPROVAL_REQUIRED|DEFER|SKIP",
+        "reason": string,
+        "factors": [strings],
+    }
     """
-    # Hard stops — never touch these regardless of confidence
-    if ctx["active_process"]:
-        return _result(HIGH, "SKIP", "File is currently open by a running process.")
-    if ctx["package_owned"]:
-        return _result(HIGH, "SKIP", "File is owned by an installed system package.")
-    if ctx["git_tracked"]:
-        return _result(HIGH, "DEFER", "File is tracked in an active Git repository — needs human review.")
+    classification = candidate.get("classification", "Unknown")
+    confidence = float(candidate.get("confidence", 0.0))
+    age_days = float(candidate.get("age_days", 0.0))
+    duplicate = bool(candidate.get("duplicate_of"))
+    cpu = float(load.get("cpu_percent", 0.0))
+    io_wait = float(load.get("io_wait_percent", 0.0))
+    memory = float(load.get("memory_percent", 0.0))
 
-    is_redundant = "Redundant" in candidate["classification"] or "Cold" in candidate["classification"]
-    confidence = candidate["confidence"]
+    score = 50
+    factors = []
 
-    # Base risk purely from data intelligence
-    if is_redundant and confidence >= 0.9:
-        base_tier = LOW
-    elif is_redundant and confidence >= 0.75:
-        base_tier = MEDIUM
-    else:
-        base_tier = HIGH
-
-    # Real-time override: live system load can only make things SAFER to defer, never riskier to act
-    if system_busy and base_tier == LOW:
+    # Hard stops: if the file is in active use or package-owned, we do not optimize it.
+    if ctx.get("active_process"):
         return _result(
-            MEDIUM, "DEFER",
-            f"Data risk was LOW (confidence {confidence:.0%}), but system is busy right now "
-            f"(CPU {load['cpu_percent']:.0f}%, I/O wait {load['io_wait_percent']:.0f}%) — deferring."
+            100,
+            HIGH,
+            "SKIP",
+            "File is currently open by a running process.",
+            ["⚠ Active process detected", "⚠ Cleanup skipped for safety"],
         )
-    if system_busy and base_tier == MEDIUM:
-        return _result(HIGH, "DEFER", "Borderline risk plus high current system load — deferring.")
+    if ctx.get("package_owned"):
+        return _result(
+            100,
+            HIGH,
+            "SKIP",
+            "File is owned by an installed system package.",
+            ["⚠ Package-owned file", "⚠ System package ownership detected"],
+        )
 
-    if base_tier == LOW:
-        return _result(LOW, "AUTOMATE", f"Redundant/cold data, high confidence ({confidence:.0%}), system load normal.")
-    if base_tier == MEDIUM:
-        return _result(MEDIUM, "SCHEDULE", f"Moderate confidence ({confidence:.0%}) — schedule for a safe window or confirm.")
-    return _result(HIGH, "APPROVAL_REQUIRED", f"Low confidence ({confidence:.0%}) or ambiguous ownership — needs approval.")
+    if age_days >= 90:
+        score -= 22
+        factors.append(f"✓ Very old ({age_days:.0f} days)")
+    elif age_days < 7:
+        score += 20
+        factors.append("⚠ Recently used")
+    else:
+        factors.append(f"✓ Older file ({age_days:.0f} days)")
+        score -= 6
+
+    if "Hot" in classification:
+        score += 22
+        factors.append("⚠ Hot data")
+    elif "Warm" in classification:
+        score += 8
+        factors.append("✓ Warm data")
+    if "Cold" in classification:
+        score -= 16
+        factors.append("✓ Cold data")
+    if "Redundant" in classification:
+        score -= 12
+        factors.append("✓ Redundant data")
+
+    if duplicate:
+        score -= 16
+        factors.append("✓ Duplicate detected")
+
+    if confidence >= 0.9:
+        score -= 14
+        factors.append(f"✓ High confidence ({confidence:.0%})")
+    elif confidence >= 0.75:
+        score -= 5
+        factors.append(f"✓ Moderate confidence ({confidence:.0%})")
+    else:
+        score += 18
+        factors.append(f"⚠ Low confidence ({confidence:.0%})")
+
+    if not ctx.get("active_process"):
+        score -= 4
+        factors.append("✓ Not actively used")
+    if not ctx.get("package_owned"):
+        score -= 7
+        factors.append("✓ Not package-owned")
+    if not ctx.get("git_tracked"):
+        score -= 8
+        factors.append("✓ Not Git tracked")
+
+    # Git-tracked files are explicitly high risk and should not be auto-cleaned.
+    if ctx.get("git_tracked"):
+        score = max(score, 70)
+        factors.append("⚠ Git tracked")
+
+    if system_busy:
+        factors.append(f"⚠ High CPU ({cpu:.0f}%)")
+        factors.append(f"⚠ High I/O wait ({io_wait:.0f}%)")
+        factors.append(f"⚠ RAM at {memory:.0f}%")
+        factors.append(f"⚠ Live safety override: {str(load.get('state') or 'BUSY').upper()}")
+    else:
+        factors.append("✓ System load normal")
+
+    # Clamp and classify risk.
+    score = max(0, min(100, round(score)))
+    risk_tier = _tier_for_score(score)
+
+    # Policy decisions.
+    if ctx.get("active_process"):
+        action = "SKIP"
+    elif ctx.get("package_owned"):
+        action = "SKIP"
+    elif ctx.get("git_tracked"):
+        action = "DEFER"
+    elif system_busy:
+        action = "DEFER"
+    elif risk_tier == LOW:
+        action = "AUTOMATE"
+    elif risk_tier == MEDIUM:
+        action = "SCHEDULE"
+    else:
+        action = "APPROVAL_REQUIRED"
+
+    system_state = str(load.get("state") or "NORMAL")
+    reason = _reason_for_decision(risk_tier, action, confidence, system_busy, cpu, io_wait, system_state)
+    return {
+        "risk_score": score,
+        "risk_tier": risk_tier,
+        "action": action,
+        "reason": reason,
+        "factors": factors,
+    }
 
 
-def _result(tier, action, reason):
-    return {"risk_tier": tier, "action": action, "reason": reason}
+def _tier_for_score(score: int) -> str:
+    if score >= 66:
+        return HIGH
+    if score >= 31:
+        return MEDIUM
+    return LOW
+
+
+def _reason_for_decision(risk_tier, action, confidence, system_busy, cpu, io_wait, system_state="NORMAL"):
+    if action == "SKIP":
+        return "Safety check blocked this candidate because it is currently in active use or package-owned."
+    if action == "DEFER":
+        if system_state == "CRITICAL":
+            return (
+                f"Cleanup deferred because the system is currently under critical workload "
+                f"(CPU {cpu:.0f}%, I/O wait {io_wait:.0f}%, state={system_state}). "
+                f"File risk may be low, but the current system safety gate is blocking automation."
+            )
+        return (
+            f"Cleanup is deferred because the system is currently busy "
+            f"(CPU {cpu:.0f}%, I/O wait {io_wait:.0f}%, state={system_state}) or the file is Git tracked; "
+            f"this should be re-checked when the system is stable."
+        )
+    if risk_tier == LOW:
+        return f"Low-risk, stale, and/or redundant data with high confidence ({confidence:.0%}) is safe to automate."
+    if risk_tier == MEDIUM:
+        return f"Moderate risk due to confidence or file type; schedule cleanup during a safe window."
+    return f"High-risk candidate requiring approval because confidence is low or ownership is ambiguous."
+
+
+def _result(score, tier, action, reason, factors):
+    return {
+        "risk_score": int(score),
+        "risk_tier": tier,
+        "action": action,
+        "reason": reason,
+        "factors": factors,
+    }
