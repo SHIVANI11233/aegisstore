@@ -132,7 +132,7 @@ if st.session_state.results is not None:
                 "HIGH": "background-color:#f8d7da"}.get(val, "")
 
     st.dataframe(
-        df.drop(columns=["Path"]).style.applymap(risk_color, subset=["Risk"]),
+        df.drop(columns=["Path"]).style.map(risk_color, subset=["Risk"]),
         use_container_width=True, hide_index=True,
     )
 
