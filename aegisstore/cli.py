@@ -1,4 +1,4 @@
-"""
+﻿"""
 cli.py — Ties every module together and runs the live demo flow end to end.
 Usage:
     python -m aegisstore.cli scan <directory>
@@ -7,8 +7,9 @@ Usage:
 """
 import shutil
 import sys
+from pathlib import Path
 
-from . import context, db, decision_engine, executor, safety_gate, scanner, storage_story
+from . import context, db, decision_engine, executor, predictor, safety_gate, scanner, storage_story
 
 
 def human(n_bytes: float) -> str:
@@ -21,11 +22,27 @@ def human(n_bytes: float) -> str:
 
 def run_scan(target_dir: str):
     db.init_db()
+    target_dir = str(Path(target_dir))
     print(f"\n=== AegisStore scan: {target_dir} ===\n")
 
     total, used, _free = shutil.disk_usage(target_dir)
     print(f"Disk usage: {used/total:.0%}  ({human(used)} / {human(total)})")
     db.log_usage(target_dir, used, total)
+
+    fc = predictor.forecast(target_dir)
+    if fc:
+        print(f"\nGrowth forecast: {fc['growth_rate_gb_per_day']:.2f} GB/day  "
+              f"(from {fc['sample_count']} historical samples)")
+        for threshold, days in fc["predictions_days"].items():
+            if days is None:
+                print(f"  {threshold:.0%} capacity: not currently trending toward this")
+            elif days == 0:
+                print(f"  {threshold:.0%} capacity: already reached")
+            else:
+                print(f"  {threshold:.0%} capacity: ~{days:.0f} days")
+    else:
+        print("\n(Not enough usage history yet for a growth forecast - "
+              "run seed_history.py for a demo, or scan daily to build real history.)")
 
     print("\nScanning filesystem...")
     records = scanner.scan_and_classify(target_dir)
@@ -76,6 +93,9 @@ def run_scan(target_dir: str):
         "automated_count": len(automated),
         "avg_confidence": avg_conf,
     }
+    if fc:
+        summary["growth_rate_gb_per_day"] = fc["growth_rate_gb_per_day"]
+        summary["days_to_90pct"] = fc["predictions_days"].get(0.90)
 
     print("=== Storage Story ===")
     print(storage_story.generate_story(summary))

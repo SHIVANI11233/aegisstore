@@ -1,4 +1,4 @@
-"""
+﻿"""
 storage_story.py — Explainability layer.
 Turns the structured scan + decision output into a plain-English narrative.
 Uses the Anthropic API if ANTHROPIC_API_KEY is set; otherwise falls back to a
@@ -30,10 +30,15 @@ def _template_story(summary: dict) -> str:
     if summary.get("deferred_count", 0) > 0:
         parts.append(
             f"{summary['deferred_count']} action(s) were deferred because the system was under "
-            f"heavy load at the time — AegisStore will re-check them automatically."
+            f"heavy load at the time - AegisStore will re-check them automatically."
         )
     if summary.get("automated_count", 0) > 0:
         parts.append(f"{summary['automated_count']} low-risk item(s) were safely quarantined.")
+    if summary.get("growth_rate_gb_per_day") and summary.get("days_to_90pct"):
+        parts.append(
+            f"At the current growth rate of {summary['growth_rate_gb_per_day']:.1f} GB/day, "
+            f"this disk will reach 90% capacity in about {summary['days_to_90pct']:.0f} days."
+        )
     parts.append(f"Overall confidence: {summary.get('avg_confidence', 0):.0%}.")
     return " ".join(parts)
 
@@ -53,5 +58,5 @@ def generate_story(summary: dict) -> str:
             messages=[{"role": "user", "content": json.dumps(summary)}],
         )
         return "".join(block.text for block in resp.content if block.type == "text").strip()
-    except Exception as e:  # network issues, missing package, etc. — never let this break the demo
-        return _template_story(summary) + f"\n\n[Note: live AI narrative unavailable, showing template — {e}]"
+    except Exception as e:
+        return _template_story(summary) + f"\n\n[Note: live AI narrative unavailable, showing template - {e}]"
