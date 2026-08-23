@@ -10,9 +10,29 @@ import pandas as pd
 import streamlit as st
 
 from aegisstore import context, db, decision_engine, executor, predictor, safety_gate, scanner, storage_story
+from demo_setup import build_demo
 
 st.set_page_config(page_title="AegisStore", page_icon="AegisStore", layout="wide")
 db.init_db()
+
+DEFAULT_TARGET = Path("./demo_disk")
+
+
+def ensure_demo_environment(target: Path):
+    """Self-bootstraps demo data + growth history on first load, so a deployed
+    link works immediately for a judge with zero setup - no terminal needed."""
+    if not target.exists():
+        build_demo(target)
+    total, used, _free = shutil.disk_usage(target)
+    db.log_usage(str(target), used, total)
+    if predictor.forecast(str(target), min_points=3) is None:
+        predictor.seed_synthetic_history(str(target), total, current_used_bytes=used,
+                                          daily_growth_gb=1.8, days_back=14)
+
+
+if "bootstrapped" not in st.session_state:
+    ensure_demo_environment(DEFAULT_TARGET)
+    st.session_state.bootstrapped = True
 
 
 def human(n_bytes: float) -> str:
@@ -28,7 +48,7 @@ st.caption("AI understands what can be optimized. AegisStore decides whether it 
 
 col_input, col_scan = st.columns([3, 1])
 target_dir = col_input.text_input("Directory to scan", value="./demo_disk")
-scan_clicked = col_scan.button("Scan now", use_container_width=True)
+scan_clicked = col_scan.button("Scan now", width='stretch')
 
 load = safety_gate.read_system_load(sample_seconds=0.3)
 busy = safety_gate.is_system_busy(load)
@@ -133,7 +153,7 @@ if st.session_state.results is not None:
 
     st.dataframe(
         df.drop(columns=["Path"]).style.map(risk_color, subset=["Risk"]),
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
     st.subheader("Take Action")
@@ -163,6 +183,6 @@ audit_rows = db.recent_audit(limit=15)
 if audit_rows:
     audit_df = pd.DataFrame([dict(r) for r in audit_rows])
     st.dataframe(audit_df[["event_time", "action", "path", "reversible", "detail"]],
-                 use_container_width=True, hide_index=True)
+                 width='stretch', hide_index=True)
 else:
     st.write("No actions taken yet.")
