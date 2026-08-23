@@ -4,6 +4,7 @@ Run with: streamlit run dashboard.py
 """
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -46,9 +47,25 @@ def human(n_bytes: float) -> str:
 st.title("AegisStore")
 st.caption("AI understands what can be optimized. AegisStore decides whether it is safe to act.")
 
-col_input, col_scan = st.columns([3, 1])
+col_input, col_scan, col_reset = st.columns([3, 1, 1])
 target_dir = col_input.text_input("Directory to scan", value="./demo_disk")
 scan_clicked = col_scan.button("Scan now", width='stretch')
+reset_clicked = col_reset.button("Reset demo", width='stretch',
+                                  help="Wipes demo_disk, quarantine, and history, then rebuilds a fresh demo environment.")
+
+if reset_clicked:
+    target = Path(target_dir)
+    if target.exists():
+        shutil.rmtree(target)
+    quarantine_dir = Path(__file__).parent / "quarantine"
+    if quarantine_dir.exists():
+        shutil.rmtree(quarantine_dir)
+    db_path = Path(__file__).parent / "aegisstore.db"
+    if db_path.exists():
+        db_path.unlink()
+    for key in ["bootstrapped", "results", "summary", "reclaimable", "forecast"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 load = safety_gate.read_system_load(sample_seconds=0.3)
 busy = safety_gate.is_system_busy(load)
@@ -144,6 +161,15 @@ if st.session_state.results is not None:
         d95 = fc["predictions_days"].get(0.95)
         fcol3.metric("Days to 95% capacity", f"{d95:.0f}" if d95 else "N/A")
 
+        history_rows = db.usage_series(st.session_state.target)
+        if len(history_rows) >= 2:
+            chart_df = pd.DataFrame([{
+                "Date": datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d"),
+                "Used (GB)": r["used_bytes"] / (1024 ** 3),
+            } for r in history_rows])
+            chart_df = chart_df.drop_duplicates(subset="Date", keep="last").set_index("Date")
+            st.line_chart(chart_df, height=220)
+
     st.subheader("Scan Results - Risk-Adaptive Decisions")
     df = pd.DataFrame(st.session_state.results)
 
@@ -155,6 +181,11 @@ if st.session_state.results is not None:
         df.drop(columns=["Path"]).style.map(risk_color, subset=["Risk"]),
         width='stretch', hide_index=True,
     )
+
+    csv_bytes = df.drop(columns=["Path"]).to_csv(index=False).encode("utf-8")
+    st.download_button("Download report (CSV)", data=csv_bytes,
+                        file_name=f"aegisstore_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv")
 
     st.subheader("Take Action")
     low_risk = [r for r in st.session_state.results if r["Action"] == "AUTOMATE"]
