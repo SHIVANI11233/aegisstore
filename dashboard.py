@@ -1,4 +1,4 @@
-﻿"""
+"""
 dashboard.py — AegisStore visual dashboard (Streamlit).
 Run with: streamlit run dashboard.py
 """
@@ -52,6 +52,32 @@ target_dir = col_input.text_input("Directory to scan", value="./demo_disk")
 scan_clicked = col_scan.button("Scan now", width='stretch')
 reset_clicked = col_reset.button("Reset demo", width='stretch',
                                   help="Wipes demo_disk, quarantine, and history, then rebuilds a fresh demo environment.")
+
+
+st.subheader("🛡️ Threat-Model & Safety Guarantees")
+
+st.info(
+    """
+    **AegisStore is recommendation-first and safety-aware.**
+
+    • 🗑️ **No direct deletion** — cleanup actions are not automatically deleted;
+      files must go through the project's controlled/quarantine workflow.
+
+    • 🔒 **No touching open files** — files currently used by an active process
+      are protected from optimization.
+
+    • ⚠️ **Risk-threshold gating** — recommendations are evaluated using
+      risk and safety signals before any optimization action is considered.
+
+    • 🖥️ **Live-load deferral** — when CPU, RAM, or I/O load is high,
+      optimization can be deferred instead of acting immediately.
+
+    • 📦 **Dependency awareness** — package-owned, Git-tracked, symlink-related,
+      systemd-referenced, and cron-referenced files can be flagged for review.
+
+    **Human remains in control:** AegisStore recommends; the user decides.
+    """
+)
 
 if reset_clicked:
     target = Path(target_dir)
@@ -114,9 +140,39 @@ if scan_clicked:
         for idx, c in enumerate(candidates):
             ctx = context.enrich(str(c["path"]))
             decision = decision_engine.assess(c, ctx, load, busy)
+
+            if decision["action"] == "DEFER":
+                db.log_schedule_event(
+                    c["path"],
+                    "DEFERRED",
+                    load,
+                    reason=decision["reason"],
+                )
+            else:
+                previous_events = [
+                    r for r in db.recent_audit(limit=50)
+                    if r["path"] == str(c["path"])
+                    and r["action"] == "DEFERRED"
+                ]
+                if previous_events:
+                    db.log_schedule_event(
+                        c["path"],
+                        "RETRIED",
+                        load,
+                        reason="System load is now within safe limits.",
+                    )
+
             cid = db.save_candidate(c)
-            db.save_decision(cid, {**ctx, "cpu_percent": load["cpu_percent"],
-                                    "io_wait_percent": load["io_wait_percent"], **decision})
+            db.save_decision(
+                cid,
+                {
+                    **ctx,
+                    "cpu_percent": load["cpu_percent"],
+                    "io_wait_percent": load["io_wait_percent"],
+                    **decision,
+                },
+            )
+
             rows.append({
                 "File": c["path"].name,
                 "Path": str(c["path"]),
@@ -251,45 +307,271 @@ if st.session_state.results is not None:
     rc3.metric("HIGH", risk_counts.get("HIGH", 0))
     rc4.metric("Total candidates", len(st.session_state.results))
 
-    st.subheader("Candidate Results - Risk-Adaptive Decisions")
-    df = pd.DataFrame(st.session_state.results)
+st.subheader("Candidate Results - Risk-Adaptive Decisions")
+
+results = st.session_state.get("results", [])
+df = pd.DataFrame(results)
+
+if not df.empty:
+
+    # Support both the original dashboard fields and
+    # the newer recommendation-engine fields.
+    def get_value(record, *keys, default="—"):
+        for key in keys:
+            if key in record and record[key] is not None:
+                return record[key]
+        return default
+
+    display_rows = []
+
+    for record in results:
+        risk_score = get_value(
+            record,
+            "Risk Score",
+            "risk_score",
+            default="—",
+        )
+
+        risk_tier = get_value(
+            record,
+            "Risk",
+            "risk_tier",
+            default="—",
+        )
+
+        action = get_value(
+            record,
+            "Action",
+            "action",
+            "recommendation",
+            default="REVIEW",
+        )
+
+        reason = get_value(
+            record,
+            "Reason",
+            "reason",
+            "recommendation_reason",
+            default="No reason available.",
+        )
+
+        display_rows.append({
+            "File": get_value(record, "File", "file", "name"),
+            "Size": get_value(record, "Size", "size"),
+            "Age (days)": get_value(record, "Age (days)", "age_days"),
+            "Classification": get_value(
+                record,
+                "Classification",
+                "classification",
+                "usage_profile",
+            ),
+            "Future Use": (
+                f"{float(record.get('future_usage_probability', 0)) * 100:.1f}%"
+                if record.get("future_usage_probability") is not None
+                else "—"
+            ),
+            "Risk Score": risk_score,
+            "Risk": risk_tier,
+            "Recommendation": action,
+            "Reason": reason,
+        })
+
+    display_df = pd.DataFrame(display_rows)
 
     def risk_color(val):
-        return {"LOW": "background-color:#d4edda", "MEDIUM": "background-color:#fff3cd",
-                "HIGH": "background-color:#f8d7da"}.get(val, "")
+        return {
+            "LOW": "background-color:#d4edda",
+            "MEDIUM": "background-color:#fff3cd",
+            "HIGH": "background-color:#f8d7da",
+        }.get(val, "")
 
-    display_df = df[["File", "Size", "Age (days)", "Classification", "Confidence",
-                     "Risk Score", "Risk", "Action", "Reason"]].copy()
-    display_df["Risk"] = display_df["Risk"].map({"LOW": "LOW", "MEDIUM": "MEDIUM", "HIGH": "HIGH"})
-    st.dataframe(display_df.style.map(risk_color, subset=["Risk"]), width='stretch', hide_index=True)
+    st.dataframe(
+        display_df.style.map(
+            risk_color,
+            subset=["Risk"],
+        ),
+        width="stretch",
+        hide_index=True,
+    )
 
-    csv_df = df[["File", "Size", "Age (days)", "Classification", "Confidence",
-                 "Path", "Active", "Pkg-owned", "Git-tracked",
-                 "risk_score", "risk_tier", "action", "reason", "factors"]].copy()
-    csv_df["factors"] = csv_df["factors"].apply(lambda v: "; ".join(v) if isinstance(v, list) else v)
+    # CSV report using only fields that actually exist.
+    csv_rows = []
+
+    for record in results:
+        csv_rows.append({
+            "File": get_value(record, "File", "file", "name"),
+            "Path": get_value(record, "Path", "path"),
+            "Size": get_value(record, "Size", "size"),
+            "Age (days)": get_value(
+                record,
+                "Age (days)",
+                "age_days",
+            ),
+            "Classification": get_value(
+                record,
+                "Classification",
+                "classification",
+                "usage_profile",
+            ),
+            "Future Usage Probability": record.get(
+                "future_usage_probability",
+                "",
+            ),
+            "Recommendation": get_value(
+                record,
+                "recommendation",
+                "Action",
+                "action",
+            ),
+            "Recommendation Reason": get_value(
+                record,
+                "recommendation_reason",
+                "Reason",
+                "reason",
+            ),
+            "Risk Score": get_value(
+                record,
+                "risk_score",
+                "Risk Score",
+            ),
+            "Risk Tier": get_value(
+                record,
+                "risk_tier",
+                "Risk",
+            ),
+            "Safety Blocked": record.get(
+                "safety_blocked",
+                False,
+            ),
+            "Safety Flags": "; ".join(
+                record.get("safety_flags", [])
+                if isinstance(record.get("safety_flags", []), list)
+                else []
+            ),
+        })
+
+    csv_df = pd.DataFrame(csv_rows)
     csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download report (CSV)", data=csv_bytes,
-                        file_name=f"aegisstore_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv")
 
+    st.download_button(
+        "Download report (CSV)",
+        data=csv_bytes,
+        file_name=(
+            f"aegisstore_report_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        ),
+        mime="text/csv",
+    )
+
+else:
+    st.info("No candidate results available. Run a filesystem scan first.")
     st.subheader("Why This Decision?")
-    candidate_names = [r["File"] for r in st.session_state.results]
-    selected_file = st.selectbox("Select candidate", candidate_names, index=0 if candidate_names else None)
-    selected_candidate = next((r for r in st.session_state.results if r["File"] == selected_file), None)
-    if selected_candidate:
-        st.markdown(f"**File:** {selected_candidate['File']}")
-        st.markdown(f"**Risk Score:** {selected_candidate['Risk Score']}")
-        st.markdown(f"**Risk Level:** {selected_candidate['Risk']}")
-        st.markdown(f"**Recommended Action:** {selected_candidate['Action']}")
-        factors = selected_candidate.get("factors", [])
-        st.markdown("**Why?**")
-        if factors:
-            for factor in factors:
-                st.write(factor)
-        else:
-            st.write("No explanatory factors available.")
-        st.markdown(f"**Decision reason:** {selected_candidate['Reason']}")
-        st.markdown(f"**Recommendation:** {selected_candidate['Action']}")
+
+    results = st.session_state.get("results") or []
+
+    candidate_names = [
+        r.get("File", r.get("file", r.get("name", "Unknown")))
+        for r in results
+    ]
+
+    if candidate_names:
+        selected_file = st.selectbox(
+            "Select candidate",
+            candidate_names,
+            index=0,
+        )
+
+        selected_candidate = next(
+            (
+                r for r in results
+                if r.get("File", r.get("file", r.get("name"))) == selected_file
+            ),
+            None,
+        )
+
+        if selected_candidate:
+            st.markdown(f"**File:** {selected_candidate['File']}")
+            st.markdown(f"**Risk Score:** {selected_candidate['Risk Score']}")
+            st.markdown(f"**Risk Level:** {selected_candidate['Risk']}")
+            st.markdown(f"**Recommended Action:** {selected_candidate['Action']}")
+
+            factors = selected_candidate.get("factors", [])
+            st.markdown("**Why?**")
+
+            if factors:
+                for factor in factors:
+                    st.write(factor)
+            else:
+                st.write("No explanatory factors available.")
+
+            st.markdown(
+                f"**Decision reason:** {selected_candidate['Reason']}"
+            )
+
+            st.markdown(
+                f"**Recommendation:** {selected_candidate['Action']}"
+            )
+
+            st.divider()
+            st.markdown("### 🔄 Counterfactual Explanation")
+
+            try:
+                from aegisstore import counterfactual
+
+                candidate_path = selected_candidate.get("Path")
+
+                original_candidate = next(
+                    (
+                        c for c in candidates
+                        if str(c["path"]) == str(candidate_path)
+                    ),
+                    None,
+                )
+
+                if original_candidate:
+                    cf = counterfactual.explain_age_change(
+                        original_candidate,
+                        context.enrich(str(original_candidate["path"])),
+                        load,
+                        busy,
+                        days_delta=-7,
+                    )
+
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.metric(
+                            "Current Risk",
+                            f"{cf['current_score']} / 100",
+                        )
+
+                    with col2:
+                        st.metric(
+                            "If 7 Days Newer",
+                            f"{cf['counterfactual_score']} / 100",
+                            delta=cf["delta"],
+                        )
+
+                    st.info(f"💡 {cf['explanation']}")
+
+                    if cf["current_action"] != cf["counterfactual_action"]:
+                        st.warning(
+                            f"Decision would change: "
+                            f"{cf['current_action']} → "
+                            f"{cf['counterfactual_action']}"
+                        )
+                    else:
+                        st.caption(
+                            f"Decision remains: {cf['current_action']}"
+                        )
+                else:
+                    st.info("Counterfactual data unavailable for this candidate.")
+
+            except Exception as e:
+                st.warning(f"Counterfactual explanation unavailable: {e}")
+
+    else:
+        st.info("No candidate results available. Run a filesystem scan first.")
 
     st.subheader("Take Action")
     auto_eligible = [r for r in st.session_state.results if r["Action"] == "AUTOMATE"]
@@ -404,3 +686,31 @@ if audit_rows:
                  width='stretch', hide_index=True)
 else:
     st.write("No actions taken yet.")
+
+st.subheader("🕐 Energy / Performance-Aware Scheduling Timeline")
+
+schedule_actions = {"DEFERRED", "RETRIED", "EXECUTED", "QUARANTINE"}
+schedule_rows = [
+    dict(r) for r in db.recent_audit(limit=50)
+    if r["action"] in schedule_actions
+]
+
+if schedule_rows:
+    timeline = []
+    for r in schedule_rows:
+        from datetime import datetime
+        timestamp = datetime.fromtimestamp(r["event_time"]).strftime("%H:%M:%S")
+        timeline.append({
+            "Time": timestamp,
+            "Event": "EXECUTED" if r["action"] == "QUARANTINE" else r["action"],
+            "File": r["path"],
+            "System Load / Reason": r["detail"],
+        })
+
+    st.dataframe(
+        pd.DataFrame(timeline),
+        width="stretch",
+        hide_index=True,
+    )
+else:
+    st.info("No scheduling events recorded yet.")

@@ -105,8 +105,57 @@ def recommend(record):
     """
     Generate a recommendation for a file.
 
+    Safety/dependency checks are evaluated before
+    optimization signals.
+
     No filesystem modification is performed.
     """
+
+    # ---------------------------------------------
+    # Safety / dependency gate
+    # ---------------------------------------------
+
+    safety_checks = {
+        "active_process": bool(record.get("active_process", False)),
+        "package_owned": bool(record.get("package_owned", False)),
+        "git_tracked": bool(record.get("git_tracked", False)),
+        "is_symlink": bool(record.get("is_symlink", False)),
+        "is_symlink_target": bool(
+            record.get("is_symlink_target", False)
+        ),
+        "referenced_by_systemd": bool(
+            record.get("referenced_by_systemd", False)
+        ),
+        "referenced_by_cron": bool(
+            record.get("referenced_by_cron", False)
+        ),
+    }
+
+    blocked_reasons = [
+        name
+        for name, detected in safety_checks.items()
+        if detected
+    ]
+
+    if blocked_reasons:
+        return {
+            **record,
+            "reproducibility_score": reproducibility_score(record),
+            "storage_impact_score": storage_impact_score(record),
+            "recommendation": "REVIEW",
+            "recommendation_reason": (
+                "Safety/dependency check requires human review. "
+                "Detected: "
+                + ", ".join(blocked_reasons)
+                + ". Optimization is not recommended automatically."
+            ),
+            "safety_flags": blocked_reasons,
+            "safety_blocked": True,
+        }
+
+    # ---------------------------------------------
+    # Optimization signals
+    # ---------------------------------------------
 
     probability = float(
         record.get(
@@ -119,18 +168,9 @@ def recommend(record):
         record.get("is_duplicate", False)
     )
 
-    profile = record.get(
-        "usage_profile",
-        "INACTIVE",
-    )
+    reproducibility = reproducibility_score(record)
 
-    reproducibility = reproducibility_score(
-        record
-    )
-
-    storage_impact = storage_impact_score(
-        record
-    )
+    storage_impact = storage_impact_score(record)
 
     # ---------------------------------------------
     # High-confidence keep
@@ -213,15 +253,6 @@ def recommend(record):
         "storage_impact_score": storage_impact,
         "recommendation": action,
         "recommendation_reason": reason,
+        "safety_flags": [],
+        "safety_blocked": False,
     }
-
-
-def recommend_records(records):
-    """
-    Generate recommendations for multiple files.
-    """
-
-    return [
-        recommend(record)
-        for record in records
-    ]
