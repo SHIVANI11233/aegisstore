@@ -32,10 +32,13 @@ def assess(candidate: dict, ctx: dict, load: dict, system_busy: bool) -> dict:
     io_wait = float(load.get("io_wait_percent", 0.0))
     memory = float(load.get("memory_percent", 0.0))
 
+    # Start from a neutral risk level.
+    # The score represents risk of making an unsafe optimization decision:
+    # higher = more risky, lower = safer.
     score = 50
     factors = []
 
-    # Hard stops: if the file is in active use or package-owned, we do not optimize it.
+    # Hard stops: active or package-owned files must never be optimized.
     if ctx.get("active_process"):
         return _result(
             100,
@@ -53,55 +56,54 @@ def assess(candidate: dict, ctx: dict, load: dict, system_busy: bool) -> dict:
             ["⚠ Package-owned file", "⚠ System package ownership detected"],
         )
 
+    # Age / recency
     if age_days >= 90:
-        score -= 22
+        score -= 12
         factors.append(f"✓ Very old ({age_days:.0f} days)")
     elif age_days < 7:
-        score += 20
+        score += 15
         factors.append("⚠ Recently used")
     else:
+        score -= 3
         factors.append(f"✓ Older file ({age_days:.0f} days)")
-        score -= 6
 
+    # Usage classification
     if "Hot" in classification:
-        score += 22
+        score += 15
         factors.append("⚠ Hot data")
     elif "Warm" in classification:
-        score += 8
+        score += 5
         factors.append("✓ Warm data")
-    if "Cold" in classification:
-        score -= 16
+    elif "Cold" in classification:
+        score -= 8
         factors.append("✓ Cold data")
-    if "Redundant" in classification:
-        score -= 12
+
+    # Redundancy
+    if "Redundant" in classification or duplicate:
+        score -= 10
         factors.append("✓ Redundant data")
 
-    if duplicate:
-        score -= 16
-        factors.append("✓ Duplicate detected")
-
+    # Prediction confidence
     if confidence >= 0.9:
-        score -= 14
+        score -= 5
         factors.append(f"✓ High confidence ({confidence:.0%})")
     elif confidence >= 0.75:
-        score -= 5
         factors.append(f"✓ Moderate confidence ({confidence:.0%})")
     else:
-        score += 18
+        score += 10
         factors.append(f"⚠ Low confidence ({confidence:.0%})")
 
+    # Safety context.
     if not ctx.get("active_process"):
-        score -= 4
         factors.append("✓ Not actively used")
     if not ctx.get("package_owned"):
-        score -= 7
         factors.append("✓ Not package-owned")
-    if not ctx.get("git_tracked"):
-        score -= 8
-        factors.append("✓ Not Git tracked")
 
-    # Git-tracked files are explicitly high risk and should not be auto-cleaned.
-    if ctx.get("git_tracked"):
+    if not ctx.get("git_tracked"):
+        factors.append("✓ Not Git tracked")
+    else:
+        # Git-tracked files are explicitly high risk and should not
+        # be automatically optimized.
         score = max(score, 70)
         factors.append("⚠ Git tracked")
 
